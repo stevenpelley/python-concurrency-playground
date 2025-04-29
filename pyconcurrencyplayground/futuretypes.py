@@ -2,8 +2,13 @@ import collections.abc
 import concurrent.futures
 import dataclasses
 import functools
+import logging
 import threading
 import typing
+
+from pyconcurrencyplayground.utils import log_extra
+
+logger = logging.getLogger(__name__)
 
 
 class FutureOutcomes:
@@ -54,30 +59,14 @@ class FutureAndTaskData[FutureT, TaskDataT]:
     task_data: TaskDataT
 
 
-@dataclasses.dataclass(frozen=True, init=False)
-class ResultAndTaskData[FutureT, TaskDataT](FutureAndTaskData[FutureT, TaskDataT]):
+@dataclasses.dataclass(frozen=True)
+class ResultAndTaskData[FutureT, TaskDataT]:
     """
     Unpacks the result and exception from future for structural matching.
     """
 
     result: FutureOutcome[FutureT]
-
-    def __init__(
-        self,
-        future: concurrent.futures.Future[FutureT],
-        task_data: TaskDataT,
-        result: FutureOutcome[FutureT],
-    ):
-        """Due to a bug in pylance it cannot recognize kwargs generated from a
-        parent constructor that has generic type var.  So here we manually
-        create the constructor and then use object.__setattr__ to assign to
-        frozen fields"""
-        object.__setattr__(self, "future", future)
-        object.__setattr__(self, "task_data", task_data)
-        object.__setattr__(self, "result", result)
-
-    def __str__(self) -> str:
-        return f"{self.task_data}: {self.result}"
+    task_data: TaskDataT
 
 
 def wait_and_zip[FutureT, TaskDataT](
@@ -100,11 +89,13 @@ def wait_and_zip[FutureT, TaskDataT](
         future_and_label = future_to_pair[f]
         result: FutureOutcome[FutureT] = future_to_outcome(f)
         result_and_task_data = ResultAndTaskData(
-            future=future_and_label.future,
             task_data=future_and_label.task_data,
             result=result,
         )
-        print(f"future completed. {result_and_task_data}")
+        logger.info(
+            "future completed",
+            extra=log_extra(result_and_task_data=result_and_task_data),
+        )
         done_results.append(result_and_task_data)
     return (
         done_results,
