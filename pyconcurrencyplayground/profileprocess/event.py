@@ -34,8 +34,15 @@ class SignalEvent:
     signal_num: int
 
 
+class EndEvent: ...
+
+
 type Event = (
-    ProcessCreatedEvent | ProcessTerminatedEvent | ProcessExitedEvent | SignalEvent
+    ProcessCreatedEvent
+    | ProcessTerminatedEvent
+    | ProcessExitedEvent
+    | SignalEvent
+    | EndEvent
 )
 
 

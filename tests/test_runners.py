@@ -7,17 +7,17 @@ import typing
 
 import pytest
 
-from pyconcurrencyplayground.profileprocess import Runner, RunnerFactory
+from pyconcurrencyplayground.profileprocess import RUNNERS
 from pyconcurrencyplayground.profileprocess.event import (
+    EndEvent,
     Event,
     ProcessCreatedEvent,
     ProcessExitedEvent,
     ProcessTerminatedEvent,
     SignalEvent,
 )
-from pyconcurrencyplayground.profileprocess.runners import (
-    RUNNERS,
-)
+from pyconcurrencyplayground.profileprocess.runner import Runner
+from pyconcurrencyplayground.profileprocess.runners import RunnerFactory
 
 type Trigger = typing.Literal[
     "SIGNAL", "TERM_SUPPORTING_PROCESS", "TERM_PROCESS_UNDER_TEST"
@@ -217,11 +217,45 @@ def _read_process_under_test_event(
     )
 
 
-def _assert_signal_event_order(events: list[Event]) -> None:
-    # processes created.  Must be contiguous.  Record number/max ordinal
-    num_processes = _read_process_created_events_at_beginning(events)
-    next_idx = num_processes
+def _read_supporting_process_exited_event(
+    events: list[Event],
+    idx: int,
+    num_processes: int,
+) -> int:
+    """
+    Read and assert that the next event is a supporting process exited.
+    Return the ordinal of the exited supported process.
+    Assert that the ordinal is appropriate given the number of processes
+    """
+    assert len(events) > idx, (
+        f"no more events, expecting supporting process exited. idx: {idx}. "
+        f"events: {events}"
+    )
+    event = events[idx]
+    error_prefix = "expected supporting process exited"
+    error_suffix = f"{event}. idx: {idx}. events: {events}"
+    match event:
+        case ProcessExitedEvent(ordinal=ordinal) if ordinal == 0:
+            raise AssertionError(
+                f"{error_prefix}. Found process under test exited: {error_suffix}"
+            )
+        case ProcessExitedEvent(ordinal=ordinal) if (
+            ordinal < 0 or ordinal >= num_processes
+        ):
+            raise AssertionError(
+                f"{error_prefix}. invalid process ordinal: {ordinal}. {error_suffix}"
+            )
+        case ProcessExitedEvent(ordinal=ordinal):
+            return ordinal
+        case _:
+            raise AssertionError(f"{error_prefix}. incorrect event: {error_suffix}")
 
+
+def _assert_signal_event_order(
+    events: list[Event],
+    next_idx: int,
+    num_processes: int,
+) -> int:
     # signal arrives
     _read_signal_event(events, next_idx)
     next_idx += 1
@@ -241,45 +275,117 @@ def _assert_signal_event_order(events: list[Event]) -> None:
     # process under test exits
     _read_process_under_test_event(events, next_idx, "EXITED")
     next_idx += 1
-
-    # must be no more events
-    assert next_idx == len(events), (
-        f"Extraneous events.  idx: {next_idx}. events: {events}"
-    )
+    return next_idx
 
 
-def _assert_process_under_test_termed_event_order(events: list[Event]) -> None:
-    # processes created.  Must be contiguous.  Record number/max ordinal
-
+def _assert_process_under_test_termed_event_order(
+    events: list[Event],
+    next_idx: int,
+    num_processes: int,
+) -> int:
     # process under test exits
+    _read_process_under_test_event(events, next_idx, "EXITED")
+    next_idx += 1
 
     # supporting processes are terminated and exit.  Possible that some exit
     # before others are terminated
+    terminated_and_exited_events = _read_process_terminated_and_exited_events(
+        events, next_idx, set(range(1, num_processes))
+    )
+    next_idx += terminated_and_exited_events
 
     # process under test optionally terminated (no harm)
-    pass
+    if len(events) >= next_idx:
+        _read_process_under_test_event(events, next_idx, "TERMINATED")
+        next_idx += 1
+    return next_idx
 
 
-def _assert_supporting_process_termed_event_order(events: list[Event]) -> None:
-    # processes created.  Must be contiguous.  Record number/max ordinal
-
+def _assert_supporting_process_termed_event_order(
+    events: list[Event],
+    next_idx: int,
+    num_processes: int,
+) -> int:
     # some supporting process exits
+    exited_ordinal = _read_supporting_process_exited_event(
+        events, next_idx, num_processes
+    )
+    next_idx += 1
 
     # supporting processes are terminated and exit.  Possible that some exit
     # before others are terminated.  The process that previously exited need not
     # be terminated.
+    expected_ordinals = set(range(1, num_processes))
+    expected_ordinals.discard(exited_ordinal)
+    terminated_and_exited_events = _read_process_terminated_and_exited_events(
+        events,
+        next_idx,
+        expected_ordinals,
+        optionally_terminated_ordinal=exited_ordinal,
+    )
+    next_idx += terminated_and_exited_events
 
     # process under test is terminated
+    _read_process_under_test_event(events, next_idx, "TERMINATED")
+    next_idx += 1
 
     # process under test exits
-    pass
+    _read_process_under_test_event(events, next_idx, "EXITED")
+    next_idx += 1
+
+    return next_idx
+
+
+class AssertEventOrder(typing.Protocol):
+    """
+    Assert event order given events, the next id to start at, and the number of
+    processes observed started.
+
+    returns the next index after having observed all expected events
+    """
+
+    def __call__(
+        self,
+        events: list[Event],
+        next_idx: int,
+        num_processes: int,
+    ) -> int: ...
+
+
+asserts_by_trigger: dict[Trigger, AssertEventOrder] = {}
+asserts_by_trigger["SIGNAL"] = _assert_signal_event_order
+asserts_by_trigger["TERM_PROCESS_UNDER_TEST"] = (
+    _assert_process_under_test_termed_event_order
+)
+asserts_by_trigger["TERM_SUPPORTING_PROCESS"] = (
+    _assert_supporting_process_termed_event_order
+)
+
+
+def _assert_event_order_prologue(events: list[Event], next_idx: int) -> None:
+    assert len(events) > next_idx, (
+        f"no more events, expecting EndEvent. idx: {next_idx}. events: {events}"
+    )
+    event = events[next_idx]
+    assert isinstance(event, EndEvent), (
+        f"expecting EndEvent. idx: {next_idx}. events: {events}"
+    )
+
+
+def _assert_event_order_by_trigger(events: list[Event], trigger: Trigger) -> None:
+    # processes created.  Must be contiguous.  Record number/max ordinal
+    num_processes = _read_process_created_events_at_beginning(events)
+    next_idx = num_processes
+
+    next_idx = asserts_by_trigger[trigger](events, next_idx, num_processes)
+
+    _assert_event_order_prologue(events, next_idx)
 
 
 tests: list[tuple[tuple[str, RunnerFactory], Trigger]] = list(
     itertools.product(
         sorted(RUNNERS.items()),
-        # ["SIGNAL", "TERM_SUPPORTING_PROCESS", "TERM_PROCESS_UNDER_TEST"],
-        ["SIGNAL"],
+        ["SIGNAL", "TERM_SUPPORTING_PROCESS", "TERM_PROCESS_UNDER_TEST"],
     )
 )
 
@@ -296,4 +402,4 @@ test_args: list[tuple[RunnerFactory, Trigger]] = [
 def test_runners(runner_factory: RunnerFactory, trigger: Trigger) -> None:
     runner = runner_factory()
     events = _run(runner, trigger)
-    _assert_signal_event_order(events)
+    _assert_event_order_by_trigger(events, trigger)
