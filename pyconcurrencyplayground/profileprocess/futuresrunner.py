@@ -30,31 +30,39 @@ class SignalTaskData:
         return "(SignalTaskData)"
 
 
+class ProcessProtocol(typing.Protocol):
+    @property
+    def pid(self) -> int: ...
+    def terminate(self) -> None: ...
+
+
 @dataclasses.dataclass(frozen=True)
-class ProcessTaskData:
+class ProcessTaskData[T: ProcessProtocol]:
     ordinal: int
-    popen: subprocess.Popen[bytes]
+    process: T
 
     def terminate(self) -> None:
         logger.info(
             "terminating process",
-            extra=log_extra(ordinal=self.ordinal, pid=self.popen.pid),
+            extra=log_extra(ordinal=self.ordinal, pid=self.process.pid),
         )
-        self.popen.terminate()
+        self.process.terminate()
 
     def __str__(self) -> str:
-        return f"(ProcessTaskData: ordinal={self.ordinal}. pid={self.popen.pid}"
+        return f"(ProcessTaskData: ordinal={self.ordinal}. pid={self.process.pid}"
 
     def obj_json_default(self) -> typing.Any:
         """Overrides json serialization for logging"""
-        return {"ordinal": self.ordinal, "popen": {"pid": self.popen.pid}}
+        return {"ordinal": self.ordinal, "popen": {"pid": self.process.pid}}
 
 
 type SignalFutureAndTaskData = pyconcurrencyplayground.futuretypes.FutureAndTaskData[
     int, SignalTaskData
 ]
+type PopenTaskData = ProcessTaskData[subprocess.Popen[bytes]]
+type ProcessReturn = tuple[bytes, bytes]
 type ProcessFutureAndTaskData = pyconcurrencyplayground.futuretypes.FutureAndTaskData[
-    tuple[bytes, bytes], ProcessTaskData
+    ProcessReturn, PopenTaskData
 ]
 
 # "|" with additional event types if needed
@@ -115,15 +123,15 @@ class FuturesRunner(Runner, abc.ABC):
 
     def _process_wait_task(
         self,
-        task_data: ProcessTaskData,
+        task_data: PopenTaskData,
         record_event: RecordEvent,
     ) -> tuple[bytes, bytes]:
-        (stdout, stderr) = task_data.popen.communicate()
+        (stdout, stderr) = task_data.process.communicate()
         record_event(
             ProcessExitedEvent(
-                pid=task_data.popen.pid,
+                pid=task_data.process.pid,
                 ordinal=task_data.ordinal,
-                exit_code=task_data.popen.returncode,
+                exit_code=task_data.process.returncode,
                 stdout=stdout,
                 stderr=stderr,
             )
@@ -154,7 +162,7 @@ class FuturesRunner(Runner, abc.ABC):
             )
 
             for i, p in enumerate(procs):
-                task_data = ProcessTaskData(ordinal=i, popen=p)
+                task_data = ProcessTaskData(ordinal=i, process=p)
                 future = ex.submit(
                     functools.partial(
                         self._process_wait_task,

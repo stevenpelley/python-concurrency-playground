@@ -1,3 +1,5 @@
+import abc
+import asyncio
 import collections.abc
 import concurrent.futures
 import dataclasses
@@ -6,6 +8,7 @@ import logging
 import threading
 import typing
 
+import pyconcurrencyplayground.utils
 from pyconcurrencyplayground.utils import log_extra
 
 logger = logging.getLogger(__name__)
@@ -39,8 +42,15 @@ type FutureOutcome[FutureOutcomeT] = (
 )
 
 
-def future_to_outcome[T](
-    future: concurrent.futures.Future[T],
+class Futurish[T](typing.Protocol):
+    def done(self) -> bool: ...
+    def cancelled(self) -> bool: ...
+    def exception(self) -> BaseException | None: ...
+    def result(self) -> T: ...
+
+
+def futurish_to_outcome[T](
+    future: Futurish[T],
 ) -> FutureOutcome[T]:
     if not future.done():
         raise ValueError("incomplete future cannot generate outcome")
@@ -53,54 +63,114 @@ def future_to_outcome[T](
         return FutureOutcomes.FutureResult(future.result())
 
 
-@dataclasses.dataclass(frozen=True)
-class FutureAndTaskData[FutureT, TaskDataT]:
-    future: concurrent.futures.Future[FutureT]
-    task_data: TaskDataT
+def futurish_json_default[T](f: Futurish[T]) -> typing.Any:
+    is_done = f.done()
+    outcome: FutureOutcome[T] | None = None
+    if is_done:
+        outcome = futurish_to_outcome(f)
+    return {"is_done": is_done, "outcome": outcome}
 
 
 @dataclasses.dataclass(frozen=True)
-class ResultAndTaskData[FutureT, TaskDataT]:
-    """
-    Unpacks the result and exception from future for structural matching.
-    """
-
-    result: FutureOutcome[FutureT]
+class BaseFutureAndTaskData[T, TaskDataT](abc.ABC):
     task_data: TaskDataT
 
+    @abc.abstractmethod
+    def get_futurish(self) -> Futurish[T]:
+        pass
 
-def wait_and_zip[FutureT, TaskDataT](
-    future_label_pairs: collections.abc.Sequence[FutureAndTaskData[FutureT, TaskDataT]],
+    def outcome(self) -> FutureOutcome[T]:
+        return futurish_to_outcome(self.get_futurish())
+
+    def obj_json_default(self) -> dict[str, typing.Any]:
+        """override json serialization"""
+        future_name = type(self.get_futurish()).__name__
+        return {
+            future_name: futurish_json_default(self.get_futurish()),
+            "task_data": pyconcurrencyplayground.utils.json_default(self.task_data),
+        }
+
+
+@dataclasses.dataclass(frozen=True, init=False)
+class FutureAndTaskData[
+    T,
+    TaskDataT,
+](BaseFutureAndTaskData[T, TaskDataT]):
+    future: concurrent.futures.Future[T]
+
+    def __init__(
+        self, future: concurrent.futures.Future[T], task_data: TaskDataT
+    ) -> None:
+        """Dataclasses inheriting from dataclass with type parameter do not
+        properly recognize inherited fields in constructor"""
+        object.__setattr__(self, "future", future)
+        object.__setattr__(self, "task_data", task_data)
+
+    def get_futurish(self) -> concurrent.futures.Future[T]:
+        return self.future
+
+
+@dataclasses.dataclass(frozen=True)
+class AsyncTaskAndTaskData[
+    T,
+    TaskDataT,
+](BaseFutureAndTaskData[T, TaskDataT]):
+    task: asyncio.Task[T]
+
+    def __init__(self, task: asyncio.Task[T], task_data: TaskDataT) -> None:
+        """Dataclasses inheriting from dataclass with type parameter do not
+        properly recognize inherited fields in constructor"""
+        object.__setattr__(self, "task", task)
+        object.__setattr__(self, "task_data", task_data)
+
+    def get_futurish(self) -> asyncio.Task[T]:
+        return self.task
+
+
+def wait_and_zip[T, TaskDataT](
+    future_data_pairs: collections.abc.Sequence[FutureAndTaskData[T, TaskDataT]],
     timeout: float | None = None,
     return_when: str = concurrent.futures.ALL_COMPLETED,
 ) -> tuple[
-    list[ResultAndTaskData[FutureT, TaskDataT]],
-    list[FutureAndTaskData[FutureT, TaskDataT]],
+    collections.abc.Sequence[FutureAndTaskData[T, TaskDataT]],
+    collections.abc.Sequence[FutureAndTaskData[T, TaskDataT]],
 ]:
-    future_labels = list(future_label_pairs)
-    future_to_pair = {p.future: p for p in future_labels}
-
-    futures = [p.future for p in future_labels]
-    (done, not_done) = concurrent.futures.wait(
-        futures, timeout=timeout, return_when=return_when
+    future_to_pair = {p.future: p for p in future_data_pairs}
+    futures = [p.future for p in future_data_pairs]
+    return _zip_and_log_wait_results(
+        future_to_pair,
+        concurrent.futures.wait(futures, timeout=timeout, return_when=return_when),
     )
-    done_results: list[ResultAndTaskData[FutureT, TaskDataT]] = []
-    for f in done:
-        future_and_label = future_to_pair[f]
-        result: FutureOutcome[FutureT] = future_to_outcome(f)
-        result_and_task_data = ResultAndTaskData(
-            task_data=future_and_label.task_data,
-            result=result,
-        )
+
+
+async def async_wait_and_zip[T, TaskDataT](
+    future_data_pairs: collections.abc.Sequence[AsyncTaskAndTaskData[T, TaskDataT]],
+    timeout: float | None = None,
+    return_when: str = concurrent.futures.ALL_COMPLETED,
+) -> tuple[
+    collections.abc.Sequence[AsyncTaskAndTaskData[T, TaskDataT]],
+    collections.abc.Sequence[AsyncTaskAndTaskData[T, TaskDataT]],
+]:
+    future_to_pair = {p.task: p for p in future_data_pairs}
+    futures = [p.task for p in future_data_pairs]
+
+    return _zip_and_log_wait_results(
+        future_to_pair,
+        await asyncio.wait(futures, timeout=timeout, return_when=return_when),
+    )
+
+
+def _zip_and_log_wait_results[F, T](
+    d: dict[F, T], done_and_not_done: tuple[set[F], set[F]]
+) -> tuple[collections.abc.Sequence[T], collections.abc.Sequence[T]]:
+    done_pairs = [d[f] for f in done_and_not_done[0]]
+    not_done_pairs = [d[f] for f in done_and_not_done[1]]
+    for p in done_pairs:
         logger.info(
             "future completed",
-            extra=log_extra(result_and_task_data=result_and_task_data),
+            extra=log_extra(future_and_data=p),
         )
-        done_results.append(result_and_task_data)
-    return (
-        done_results,
-        [future_to_pair[f] for f in not_done],
-    )
+    return done_pairs, not_done_pairs
 
 
 def _chain_future[T, U](

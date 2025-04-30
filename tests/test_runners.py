@@ -7,6 +7,10 @@ import typing
 
 import pytest
 
+import pyconcurrencyplayground
+import pyconcurrencyplayground.profileprocess
+import pyconcurrencyplayground.profileprocess.asyncrunner
+import pyconcurrencyplayground.profileprocess.asyncrunners
 from pyconcurrencyplayground.profileprocess import RUNNERS
 from pyconcurrencyplayground.profileprocess.event import (
     EndEvent,
@@ -21,6 +25,11 @@ from pyconcurrencyplayground.profileprocess.runners import RunnerFactory
 
 type Trigger = typing.Literal[
     "SIGNAL", "TERM_SUPPORTING_PROCESS", "TERM_PROCESS_UNDER_TEST"
+]
+triggers: list[Trigger] = [
+    "SIGNAL",
+    "TERM_SUPPORTING_PROCESS",
+    "TERM_PROCESS_UNDER_TEST",
 ]
 
 
@@ -383,10 +392,7 @@ def _assert_event_order_by_trigger(events: list[Event], trigger: Trigger) -> Non
 
 
 tests: list[tuple[tuple[str, RunnerFactory], Trigger]] = list(
-    itertools.product(
-        sorted(RUNNERS.items()),
-        ["SIGNAL", "TERM_SUPPORTING_PROCESS", "TERM_PROCESS_UNDER_TEST"],
-    )
+    itertools.product(sorted(RUNNERS.items()), triggers)
 )
 
 
@@ -401,5 +407,14 @@ test_args: list[tuple[RunnerFactory, Trigger]] = [
 @pytest.mark.parametrize("runner_factory,trigger", test_args, ids=test_ids)
 def test_runners(runner_factory: RunnerFactory, trigger: Trigger) -> None:
     runner = runner_factory()
+    events = _run(runner, trigger)
+    _assert_event_order_by_trigger(events, trigger)
+
+
+@pytest.mark.parametrize("trigger", triggers)
+def test_async_runner(trigger: Trigger) -> None:
+    runner: Runner = pyconcurrencyplayground.profileprocess.asyncrunner.AsyncRunner(
+        pyconcurrencyplayground.profileprocess.asyncrunners.SimpleAsyncRunner()
+    )
     events = _run(runner, trigger)
     _assert_event_order_by_trigger(events, trigger)

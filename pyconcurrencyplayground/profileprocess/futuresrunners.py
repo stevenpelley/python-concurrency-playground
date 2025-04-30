@@ -1,3 +1,4 @@
+import collections.abc
 import concurrent.futures
 import functools
 import logging
@@ -23,7 +24,7 @@ def term_supporting_processes(
 ) -> None:
     logger.info("terminating supporting processes")
     for ftd in supporting_processes:
-        pid = ftd.task_data.popen.pid
+        pid = ftd.task_data.process.pid
         ordinal = ftd.task_data.ordinal
         logger.info(
             "terminating supporting process", extra=log_extra(pid=pid, ordinal=ordinal)
@@ -37,14 +38,14 @@ def term_process_under_test(
     process_under_test: ProcessFutureAndTaskData,
     record_event: RecordFuturesRunnerEvent,
 ) -> None:
-    pid = process_under_test.task_data.popen.pid
+    pid = process_under_test.task_data.process.pid
     ordinal = 0
     logger.info(
         "terminating process under test", extra=log_extra(pid=pid, ordinal=ordinal)
     )
     record_event(
         ProcessTerminatedEvent(
-            pid=process_under_test.task_data.popen.pid, ordinal=ordinal
+            pid=process_under_test.task_data.process.pid, ordinal=ordinal
         )
     )
     process_under_test.task_data.terminate()
@@ -64,7 +65,7 @@ def one_loop_runner(
         functools.partial(term_process_under_test, process_under_test, record_event)
     )
 
-    futures_and_labels: list[
+    futures_and_labels: collections.abc.Sequence[
         pyconcurrencyplayground.futuretypes.FutureAndTaskData[typing.Any, typing.Any]
     ] = [
         sig,
