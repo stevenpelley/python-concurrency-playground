@@ -80,9 +80,8 @@ not the case here. Here are a few options:
       + Exception management is insane
       + cancellation is done via add_done_callbacks so this looks like multithreading
 + on async:
-    + I can see how this makes some things a bit simpler, like cancellation, and
-    how it avoids context switching for many concurrent tasks with repeated
-    blocking io.
+    + Cancellation is really much better than with standard blocking libraries
+    and multithreading.
     + I appreciate functions being declared async as meaning "this function may
     block".  That's helpful for reading and documenting.
     + I don't think it meaningfully helps the case of "wait for first task to
