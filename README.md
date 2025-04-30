@@ -142,3 +142,30 @@ This flexes (and adds complexity) by not requiring that a `Select` be atomically
 unregistered from all channels when completed.  Other coroutines will still find
 the `Select` in channel queues.  However, they will immediately see that it is
 completed and simply ignore and dequeue it.
+
+#### Optimizations
+make `completed` an atomic ref, or else separate it into an atomic bool and a
+separate field indicated the channel and operation.
+
+regarding asyncio there should be no need to acquire channel locks.  There is no
+await until awaiting Condition.wait.  And so I think even the `Select` locks are
+unnecessary as everything before and everything after the wait will already be
+atomic (as there is no awaiting) and Condition.wait releases the lock anyways.
+
+### Channel methods:
++ __init__(self, size: int=0)
++ close() - may not add any more senders.  Any read once there is no more
+buffered data or queued sender returns `Closed`
+
+### Operation:
+An enum/union with at least the following:
++ Send(Channel, Value, ignore_on_closed=False)
++ Get(Channel, ignore_on_closed=False)
+Where ignore_on_closed indicates that this Operation will never be selected if
+it is closed (or closed and empty in the case of a Get).
+
+### Select methods:
++ __init__(self, operation...: Operation)
++ async select() -> SendResult(channel, operation) | GetResult(channel, operation, value) | Closed(channel, operation) - note that Closed needs an operation as you may have a select that sends and gets from the same closed channel and we need to pick one.
++ add(operation) - useful when using the same `Select` in a loop
++ remove(operation) - useful when using the same `Select` in a loop
