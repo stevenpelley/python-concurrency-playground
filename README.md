@@ -169,3 +169,110 @@ it is closed (or closed and empty in the case of a Get).
 + async select() -> SendResult(channel, operation) | GetResult(channel, operation, value) | Closed(channel, operation) - note that Closed needs an operation as you may have a select that sends and gets from the same closed channel and we need to pick one.
 + add(operation) - useful when using the same `Select` in a loop
 + remove(operation) - useful when using the same `Select` in a loop
+
+### Observation: async locking
+while there is an `asyncio.Lock` class for locking in asyncio (which yields the
+coroutine on contended lock acquire and notifies/schedules on lock release),
+there are many situations where multiple variables can be accessed and even
+functions called without any possibility of interveaning coroutines running.
+Specifically, any block of code in which nothing is `await`ed is guaranteed to
+run atomically with respect to the asyncio event loop.
+
+This is somewhat similar to Rust's mutability/immutability type checking: one
+may not hold an immutable reference and pass a mutable reference to a function
+(which may modify it) and one may not hold a mutable reference and pass an
+immutable reference to a function (which may store it somewhere that outlives
+the function call).  In python, whenever you `await` you lose immediate, obvious
+control of what code will run in other coroutines -- the order of events might
+be well prescribed, but it is less clear and less intuitive.
+
+In the library code I've read these non-premptable-and-thus-atomic blocks of
+code are never made apparent.  There are no comments and no structure to
+indicate that this is intentional and required for correct execution.  The
+following might be useful mechanisms to convey this intent and to prevent
+changes from introducing `await` points in what should be non-yielding, atomic
+blocks of code:
++ asyncio.Lock: if nothing is ever `await`ed while a lock is held then the lock
+will always be available when acquired.  This hints at the true utility of
+asyncio.Lock -- to `await` in a critical section and still guarantee that it
+runs atomically.
++ wrap all mandatory atomic/non-awaiting blocks in non-async functions or
+non-async `with`.  This prevents code inside them from awaiting (both a runtime
+and static-checking error).
++ decorate the above functions/`with` with a decorator that makes it clear that
+the block is non-async for the purpose of non-yielding atomicity.
++ create a decorator for a class that enforces that no methods of the class may
+return an `Awaitable`, such as an `async` coroutine.  Place the variables that
+must be protected by this pseudo-lock in the class, and only access them through
+(non-async) methods of the class.  This resembles a java-style monitor
+(`synchronized` blocks or methods on a class).
+
+None of this matters for code that immediately `await`s coroutines and resembles
+classical blocking code within a single task.  It only matters when tasks are
+scheduled concurrently and those tasks access common data.
+
+## Efficient transactional batched tree traversal
+
+Consider FoundationDB: a distributed, ordered Key-Value store with time-bounded
+(5s) strictly serializable transactions.  Imagine storing a tree in FDB, some
+hierarchical data structure.  An example might be storing a namespace in a
+distributed system, such as a file system with a root, directories, and files,
+all organized by those directory and file names.
+
+The challenge here is to traverse a contiguous (for some definition) portion of
+the tree and act on the nodes with some multi-node transactional consistency.
+When traversing a simple 1-dimensional list the problem is simpler (but can
+still be complex): visit items in order using a streaming/pre-fetching scan and
+process the items as they arrive.  Stop scanning new items with some duration in
+the transaction remaining to give time to process the remaining items.
+
+When traversing a tree this becomes harder given some constraints that make the traversal more useful:
++ Guarantee that every node from the root to a node is read in the same
+transaction that traverses/processes the node.
+    + This guarantees that you know the complete path of the node in the
+    transaction that it is processed, preventing you from interpreting phantom
+    paths that never actually exist.
+    + This is some measure of isolated consistency for file and its path.  If
+    files are created, deleted, and moved while some large multi-transaction
+    traversal executes in parallel we might visit some files multiple times (it
+    is visited, moved later in traversal order, and visited again) or fail to
+    visit some files (it is moved earlier in traveral order, skipping over the
+    traversal cursor at that point in time)
++ Provide some notion of traversal order between transactions (order within a
+transaction doesn't matter from the perspective of data consistency -- it's a
+transaction and so appears as a snapshot).
+    + For example, you may want to visit/process all files in directory tree,
+    processing files within a directory, in lexicographical order, and then
+    recursively visit each directory in lexicographical order.
+    + Doing so can make it easier to reason about how nodes will be visited
+    across multiple transactions.  As a contrived example, if files can only be
+    moved to directories that sort later within this nested lexicographical
+    order then you can be guaranteed that all files existing at the start of the
+    multi-transaction traversal will be visited at least once.
+    + Within a single batch/transaction you still want to retrieve data
+    concurrently, out of traversal order, for improved performance.  When the
+    transaction runs out of time there will gaps in what has been
+    retrieved and processed (e.g., you've processed files in directory "/b" but
+    have not processed all files in directory "/a") and this must be prevented.
+    Alternatively, the allowed traversal ordering can be relaxed somewhat, with
+    a cross-transaction cursor remembering where in directory "/a" to begin
+    traversal, as well as to continue in directory "/c" -- this state gets
+    complex and potentially large.
+    + the overall concurrency of accesses to FDB must be limited to prevent
+    overwhelming the storage servers and stealing all network bandwidth and CPU
+    time in a presumably-multi tenant client.
+
+The goal here is to highlight some specific visitors/traversals and how they would be best implemented.
++ visiting all directories and files of a file system to export this list and
+properties of each node.
+    + a strict (inter-transactional) in-order traversal exporting a directory,
+    all immediately-contained files in lexicographical order, and then all
+    contained directories in lexicographical order.
+    + example relaxation: files immediately located in the same directory must be processed in lexicographical order but directories may be processed in parallel.
+    + example relaxation: files and directories may be visited in any order so
+    long as each path is visited exactly once (including if there is no
+    directory/file at that path at the time it is visited), the complete path
+    from root is visited int he same transaction in which the node is processed,
+    any inter-transaction/batch cursor has a bounded size, and the amount of
+    work/requests in a transaction that must be discarded and repeated in a
+    future batch/transaction is bounded.
