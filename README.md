@@ -391,6 +391,45 @@ completed and whether there are any "list children" earlier in key-order that
 might spawn new "process tasks" with higher priority.  With this introduced
 complexity this really turns more into a "Scheduler" than a priority queue.
 
+##### Useful Metrics
+
++ Time-average scheduled concurrency: (concurrency * duration with this
+concurrency) / total duration.  Higher is better.  We want to fully use allotted
+concurrency for performance.
++ Number of files and directories retrieved but not processed.  We want this to
+be lower as this indicates wasted work that must be repeated in future
+transactions.
++ Maximum number of queued tasks.  This is a proxy for how much memory we need.  Lower is better.
+
+So in all we want to use our concurrency, not require too much space to queue new tasks, and we want the work that we do to result in nodes getting processed.
+
+Consider ways to snapshot a cursor or the state of the scheduler when these metrics are bad:
++ recent time-average concurrency is low
+    + tasks complete at less than max concurrency
++ many nodes retrieved but not processed -- what is the shape of the processed and unprocessed subtree and how are they related?
++ what is the state when the most tasks are queued?
+
+##### Interesting Tree Shapes/Distributions
+
+Test execution of a semaphore/scheduler against trees of various shapes,
+measuring the metrics above.
+
++ Uniform tree of directory-depth D with N files and M directories in each directory.
+    + small D with large N, M
+    + large D with cartesian product of 2-3 values for N and M
++ randomly generate tree structure:
+    + uniform random per directory: number of sub directories and files.  Note
+    necessarily uniform distribution of possible directories and files, this can
+    be bimodal (e.g., each directory has 0 subdirectories or 1k subdirectories).
+    Might get very large or deep.
+        + possibly cap depth
+    + make structure a function of depth D.  E.g., number of subdirectories
+    grows smaller as D grows larger.
++ randomly generate subtrees.
+    + a subtree described by D, N, M.  Random distribution on these inputs.
+    + allows, for example, large wide subtrees to be placed within deep, narrow
+    directory structure.
+
 #### Inter-Batch Cursor
 
 Similarly to the priority semaphore the inter-batch cursor lists what tasks/work
