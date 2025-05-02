@@ -276,3 +276,235 @@ properties of each node.
     any inter-transaction/batch cursor has a bounded size, and the amount of
     work/requests in a transaction that must be discarded and repeated in a
     future batch/transaction is bounded.
+
+### Concepts and Data Structures
+
+#### Request Semaphore (or Scheduler?)
+Constraints concurrent requests to FDB.  Use asyncio.Semaphore or
+asyncio.BoundedSemaphore.  The challenge is to associate it with all coroutines
+and requests in the traversal and with the FDB client.  Some options to
+integrate with FDB accesses:
++ manually as an `async with` surrounding each access.  This is tedious and
+might be easy to forget.
++ via context vars that the FDB client uses.  For example, a stack of semaphores
+per context for the various limits (a per-process limit, per traversal limit,
+potentially per user or account limit).  Semaphores must always be acquired in a
+defined total order to prevent deadlock.
++ wrapping the FDB client (see Struct Embedding below) and passing along an
+instance of the effective client throughout coroutines or placing this effective
+client in a context var.  Similar to placing context var in the fdb client but
+allows isolation and extensibility without changing the client code.
+
+#### Priority Semaphore
+While traversing the tree we want to do as little work that will be wasted and
+must be repeated in a future batch because of gaps.  For example, if the root
+directory contains subdirectories `/a` and `/b` we may start to traverse both
+concurrently.  If it turns out that `/a` contains a large number of files and
+directories then we want to prioritize traversing items in `/a` before `/b` and
+at some point we will need to suspend processing `/b`.  This is also beneficial
+because it limits the number of coroutines at any point in time (ignoring the
+depth of traversal).
+
+Assume that we create new coroutines each time we traverse into a new directory,
+start scanning files and directories from an FDB iterator in a directory, and
+process a file.  We can gate task creation with a priority semaphore that
+accepts the path in its `acquire` and prioritizes tasks by lexicographical
+ordering of the paths.  Once created a task may run, but if this task creates a
+new subtask with insufficient priority it will block.
+
+We still need a request semaphore so long as FDB requests are not 1:1 with
+tasks.  That is, if any task can itself issue concurrent FDB requests we'll
+still need that request semaphore.
+
+For deep trees it's possible that at each level of traversal we create a number
+of tasks that then get blocked creating their subtasks because of insufficient
+priority.  This might need to cancel these tasks in a way that let's their
+parent pause and potentially recreate those tasks if the traversal progresses
+enough that they have high priority.
+
+##### Implementation
+
+We need to define the set of tasks that create coroutines and that require a
+permit, and these may not be the same.
++ process directory or file -- process it as if it is a leaf.  This is a
+non-recursing action that can complete without having to acquire additional
+permits.
++ get next child of directory -- once retrieved it will generate new tasks to process that child (file or directory) and to get the next child if it is a directory.
++ NOT "enter directory."  It might be advantageous to structure coroutines this
+way, but it does not require a permit.  Doing so would result in deep tree
+traversals that exhaust all permits simply traversing down the tree at which
+point it couldn't make progress.
+
+The priority key is (path, action) where actions are:
++ retrieve next child
++ process file
++ process directory
+
+A comparator on this tuple need not be a literal python tuple ordering.  By modifying the order we control the traversal order.
+
+Protect the semaphore class with a lock.  It will contain a priority queue of
+coroutines to continue in the form of (key, asyncio.Event).  There is also a
+counter of in-flight tasks.  The method `acquire(path, action)`:
+1. locks
+2. if the count of in-flight tasks is less than the limit
+    1. increment the count of in-flight tasks
+    2. release the lock and continue without blocking
+3. otherwise, add to the priority queue a key constructed from `path` and
+    `action` along with a new `asyncio.Event`
+4. release the lock
+5. block on the `asyncio.Event`
+
+The method `release()`:
+1. locks
+2. if the priority queue is empty decrement the count of in-flight tasks, unlock, return.
+3. otherwise take the next item from the priority queue.
+4. set the `asyncio.Event` for that item.
+5. unlock and return
+
+If at any point we see that the number of items in the priority queue is too
+large we have an opportunity to cancel some of those tasks.  Some things to consider:
++ We would need a handle to the associated task to cancel it.  This can be done
+by calling `get_current_task` in `acquire` and putting it in the priority queue
+as well.
++ We need the parent awaiting that task to know that it has not itself been
+cancelled.  The child task might be rescheduled later once the curser advances
+and these tasks have sufficient priority.  How do we indicate this?  The
+`Task.cancel` method accepts a str `msg` but I feel like this isn't a good use.
+We _do_ want to associate some data with the CancelledError but unfortunately
+don't have any other means to do that.  I think we'd need to create some
+object/data every time a parent creates a task that describes the cancellation,
+and this object gets passed to the priority queue.  When the parent catches the
+CancelledError it checks that data to determine what kind of cancellation it is.
+When the task is cancelled this data is first written.
++ How do we resume recreating these tasks?  The parent that scheduled them needs
+to examine which tasks were cancelled and clean up its state.  This pruning is
+only effective if in some directory multiple tasks were cancelled.  For example,
+if the "get next child" is cancelled and the 2 previous children listed were
+files and the "process files" tasks for both were also cancelled then we may
+schedule a "get next child" to retrieve those files next.  This new task will
+block on the semaphore and we've replaced 3 scheduled tasks with 1.
+
+See Reorder Buffer below.  The priority of tasks may depend on the overall state
+of task progression.  Specifically, when to allow a "process" task to proceed
+depends on whether there are process tasks earlier in key-order that have not
+completed and whether there are any "list children" earlier in key-order that
+might spawn new "process tasks" with higher priority.  With this introduced
+complexity this really turns more into a "Scheduler" than a priority queue.
+
+#### Inter-Batch Cursor
+
+Similarly to the priority semaphore the inter-batch cursor lists what tasks/work
+must be done next in the next batch.  Unlike the priority semaphore this cursor
+lasts between transactions and in some cases may even want to be persisted into
+FDB.  If the processing of files and directories is always done in order (or by
+the end of every transaction the set of processed files and directories is
+contiguous) then the cursor is simply a `key(path, action)` of where to start the
+next transaction, assuming a well-defined order on this key.
+
+If the traversal processing need not happen in order then this cursor can become
+a set of traversal intervals that have already completed, or equivalently
+intervals that still need to be traversed.  This can be pair resembling
+`(key(path, action), key(path, action))` naming the interval as traversed or not.
+
+The size of this compound cursor needs to be considered and enforcing it should
+be integrated with the priority semaphore.
+
+The number of ranges being traversed at any time within a transaction may exceed
+the intended size of the inter-batch cursor.  What is important when allowing
+this is that you are "committing to process a range" by the time the batch ends
+and the transaction commits, otherwise the transaction must fail and retry.
+Thus you may only choose to do this when all items have been listed and need
+only be processed (which you control and might be a constant amount of work per
+item) or when you somehow know the number of items that will be listed.  See
+Reorder Buffer below.
+
+#### Reorder Buffer
+
+The above mechanisms and data structures allow for concurrency within a
+transaction.  However, we often want to restrict the apparent concurrency or
+ordering of processing between transactions/batches.  For example, we may want
+to process files and directories in a strict order, or to restrict the number of
+intervals of this order that must be tracked in an inter-batch cursor.  This reordering and concurrency within a batch transaction, but enforcement of ordering by the end of the transaction somewhat resembles a reorder buffer in computer architecture:
++ the order of instructions is recorded -- here the order of directories and
+files is recorded as they are retrieved/traversed
++ instructions are only `committed` when they reach the head of the ROB (they
+are next to commit) -- files and directories are only `processed` when we have
+retrieved all files and directories earlier in key order (and there are no
+remaining children earlier in order that might be retrieved!) and all earlier
+files and directories have been processed.
++ multiple instructions may be committed in the same cycle so long as all of
+their effects take place (e.g., writing to a register file) and none of them
+trap; a contiguous segment of the ROB commits together -- we similarly want a
+contiguous interval of the tree to be traversed and processed in a transaction
+and have freedom to introduce concurrency so long as this happens.
+
+Implementing this requires:
++ details on the priority semaphore to control the level of concurrency and the
+likelihood of gap intervals.
++ details on the priority semaphore and priority of "process key/directory"
+events so that we do not process events that will cause a gap interval at the
+end of a transaction.  "Process" events should only proceed when all files and
+directories that fall earlier in key-order have been listed, and when there is a
+bounded number of such files and directories that have not been themselves
+processed.
++ Some duration of the transaction should be reserved to "drain" the queue
+    + Stop listing new children.
+        + Possibly restricted by current depth to allow leaf and near-leaf directories to complete.
+        + Possibly restrict according to key ordering -- don't list new children in greater key-order but do list children whose processing is expected to close a gap.
+    + Only "process" tasks remain.  These do not generate new work and so the queue drains.
++ If the order of "process" tasks is always constrained to limit the resulting
+inter-batch cursor then this quiescing is really an optimization to avoid wasted
+work that will be repeated in the next batch/transaction
+
+# Python and Asyncio Notes, Observations, Ideas
+
+## CSP Channels
+
+there's an aspect of golang channels that I don't see addressed: take from
+_exactly 1_ queue.  asyncio.Queue has an async get(), but if you try to
+get() from multiple Queues concurrently you cannot guarantee after the first
+completes that you can cancel or stop all the others before they pop from
+other queues.  None of the "build golang channels in python" I see on github
+address this.
+
+## Asyncio Atomic, Critical Sections, and Locking
+
+It is common in the standard library asyncio code that itself writes
+coroutines to access data from multiple tasks but not pay any special
+attention to atomicity/ordering of accesses.  For now all tasks in the same
+loop run on the same thread (and with the GIL being removed this could
+change at some point!) so there's no actual data race.  But any variable
+accesses separated by an await could have interveaning code run.  This is
+similar to the rust "mutable" argument where to accesses with an
+interveaning function call need to know that the function call doesn't
+modify any of the relevant data.  I just find it a bit harder to reason
+about if that await/function call involves several concurrent tasks using
+asyncio.wait or gather.  It looks like multi-threaded code and I think needs
+some organization if not outright asyncio.Locks
+
+## Struct Embedding
+Several times I've encountered the need to wrap-and-extend an object whose
+construction and initialization I don't control.  This is a use case for Golang
+struct embedding -- the new struct/class delegates all methods to the embedded
+class, and I construct the new class by passing an instance of the embedded
+class instead of calling a super constructor.
+
+There's not a good way to do this in Python (or Java):
++ compose the base class and manually delegate all methods.  New class does not
+extend the base class, but would implement a shared protocol (duck typing).
++ compose by extending the base class, accepting an instance of the base class,
+not calling super().__init__, and overriding every public method.  In this case
+the new class "is a" base class, for whatever that's worth.
++ compose and provide a __getattr__ that delegates to the embedded __getattr__
+if not found in the new class.  Very dynamic.  Difficult to understand.  No
+static checking.
++ Take an instance of the base class and modify or add attributes directly.
+Instance remains the base class.  Very dynamic.  No static checking.  Quite
+confusing as instances do not behave according to their class definition.
+
+I'm looking for a combination of these: automatically delegate non-overridden
+methods, construct via an instance of the base class, provide static checking
+including type checking.
+
+Might this be solved by https://peps.python.org/pep-0638/ - "Syntactic Macros"
+if accepted?

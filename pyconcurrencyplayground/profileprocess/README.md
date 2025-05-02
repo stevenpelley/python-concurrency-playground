@@ -87,22 +87,3 @@ not the case here. Here are a few options:
     + I don't think it meaningfully helps the case of "wait for first task to
     finish and then do something" -- it still looks like multithreading or the
     raw wait() primitive.
-    + there's an aspect of golang channels that I don't see addressed: take from
-    _exactly 1_ queue.  asyncio.Queue has an async get(), but if you try to
-    get() from multiple Queues concurrently you cannot guarantee after the first
-    completes that you can cancel or stop all the others before they pop from
-    other queues.  None of the "build golang channels in python" I see on github
-    address this.
-    + It is common in the standard library asyncio code that itself writes
-    coroutines to access data from multiple tasks but not pay any special
-    attention to atomicity/ordering of accesses.  For now all tasks in the same
-    loop run on the same thread (and with the GIL being removed this could
-    change at some point!) so there's no actual data race.  But any variable
-    accesses separated by an await could have interveaning code run.  This is
-    similar to the rust "mutable" argument where to accesses with an
-    interveaning function call need to know that the function call doesn't
-    modify any of the relevant data.  I just find it a bit harder to reason
-    about if that await/function call involves several concurrent tasks using
-    asyncio.wait or gather.  It looks like multi-threaded code and I think needs
-    some organization if not outright asyncio.Locks
-
